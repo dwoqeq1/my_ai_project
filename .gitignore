@@ -1,0 +1,38 @@
+# ===== 密钥与本地配置：绝对不能提交 =====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.*
+
+# ===== 运行环境与缓存 =====
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# ===== 向量库与模型缓存（体积大且可重建）=====
+chroma_db/
+*.sqlite3
+.cache/
+models/
+
+# ===== 原始备份（含历史明文密钥，仅供本地回滚，禁止入库）=====
+_原始备份_勿提交/
+
+# ===== 编辑器与系统文件 =====
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ===== 日志 =====
+*.log
+logs/

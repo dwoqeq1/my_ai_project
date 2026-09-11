@@ -1,0 +1,27 @@
+# ===== 直接依赖（版本锁定为当前 venv 实测可用版本）=====
+# 安装：pip install -r requirements.txt
+
+# --- Web 服务 ---
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.13.4
+
+# --- 大模型客户端 ---
+openai==1.30.5
+
+# --- 向量库与文本分块（RAG 链路）---
+chromadb==1.5.9
+langchain-text-splitters==1.1.2
+
+# --- 配置管理 ---
+python-dotenv==1.2.2
+
+
+# ===== 可选依赖 =====
+# 仅 test_rerank.py（CrossEncoder 精排实验）需要，会连带下载 torch 等约 2GB+ 体积。
+# 不跑精排实验的话，注释掉下面这行可以大幅减小安装体积。
+sentence-transformers==5.6.1
+
+# 回归测试框架（可选）。test_safe_math.py / test_tool_utils.py 不装 pytest 也能直接跑：
+#   venv\Scripts\python test_safe_math.py
+# pytest==8.3.4
