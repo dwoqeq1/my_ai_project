@@ -1,4 +1,4 @@
-# AI Agent + RAG 学习项目
+# AI Agent + RAG 项目
 
 一个从零开始搭 Agent 的学习项目。走过的路径：单次调用、Function Calling、Plan-Execute-Reflect、RAG，最后是 FastAPI 服务化。
 
