@@ -1,5 +1,5 @@
 # retriever.py
-# 混合检索层：向量检索 + BM25 关键词检索 -> RRF 融合 -> CrossEncoder 精排 -> 阈值过滤
+# 混合检索层：向量检索 + BM25 关键词检索 -> RRF 融合 -> 精排 -> 阈值过滤
 #
 # ================= 为什么需要这一层 =================
 # 原版 main.py 只有向量检索，存在一个固有盲区：
@@ -13,15 +13,23 @@
 # 所以用 RRF 融合：只看「排名」不看「原始分」，天然解决量纲不可比。
 #
 # 融合后的顺序仍然不够准——BM25 只看字面、向量只看语义，
-# 都不理解 query 和文档的「真实相关性」。CrossEncoder 把 query 和文档
-# 拼在一起送进模型做交叉注意力，精度远高于双塔向量，但太慢不能全库跑。
+# 都不理解 query 和文档的「真实相关性」。精排（Cross-Encoder 思路）把
+# query 和文档放在一起判断真实相关性，精度远高于双塔向量，但太贵不能全库跑。
 # 所以经典三段式：粗召回放宽（20）-> 精排收紧（3）。
 #
+# ================= 精排双后端（RERANK_BACKEND）=================
+#   api   = 阿里云百炼 qwen3-rerank。默认选择：本地零模型占用，
+#           复用同一个 DASHSCOPE_API_KEY，按量计费。
+#   local = 本地 CrossEncoder（bge-reranker-base，约 1.1GB 内存）。
+#           适合大语料/高频检索/断网场景，不产生费用。
+# 两端失败时行为一致：降级为 RRF 顺序，rerank_score 留 None，检索不崩。
+#
 # ================= 关键实测结论 =================
-# bge-reranker-base 是单输出模型，apply_softmax 必须为 False：
-#   实测 apply_softmax=True 时所有候选分数恒为 1.0000，排序退化为随机。
-#   apply_softmax=False 时可分性极好：相关 +0.107~+0.997，不相关 +0.000~+0.002。
-# 详见 config.py 中 RERANK_SCORE_THRESHOLD 的注释。
+# 1) local：bge-reranker-base 是单输出模型，apply_softmax 必须为 False。
+#    实测 True 时所有候选分数恒为 1.0000，排序退化为随机。
+# 2) 精排的排序能力远比绝对分数可靠（local 端实测同义查询分数差 72 倍但
+#    排序全对；api 端官方文档同样注明 relevance_score 不可跨请求比较）。
+#    所以两套阈值都取得偏低，宁可多放不误杀。详见 config.py 注释与 README。
 import asyncio
 import math
 import re
@@ -30,21 +38,28 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
+import httpx
+
 from config import (
     DEFAULT_TOP_K,
     ENABLE_BM25,
     ENABLE_RERANK,
     RAG_DISTANCE_THRESHOLD,
     RECALL_TOP_K,
+    RERANK_API_MODEL,
+    RERANK_API_TIMEOUT,
+    RERANK_API_URL,
     RERANK_APPLY_SOFTMAX,
+    RERANK_BACKEND,
     RERANK_MAX_LENGTH,
     RERANK_MODEL,
     RERANK_OFFLINE,
-    RERANK_SCORE_THRESHOLD,
     RRF_BM25_WEIGHT,
     RRF_K,
     RRF_VECTOR_WEIGHT,
     VERBOSE_LOG,
+    require_api_key,
+    rerank_score_threshold,
 )
 
 # ---------- BM25 超参（Okapi BM25 业界标准值）----------
@@ -286,11 +301,13 @@ class HybridRetriever:
     def _meta_of(self, i: int) -> dict:
         return self._metas[i] if i < len(self._metas) else {}
 
-    # ---------- 精排模型懒加载 ----------
+    # ---------- 精排后端懒加载 ----------
     def _get_reranker(self):
         """
-        懒加载 CrossEncoder。
-        失败时置 _reranker_failed 标记并降级为纯 RRF 排序，不让整个检索崩掉。
+        按 RERANK_BACKEND 懒加载精排后端。
+        api   -> 复用一个 httpx.Client 单例（连接池常驻，省 TLS 握手）
+        local -> 加载 CrossEncoder（约 1.1GB 内存）
+        任何失败都置 _reranker_failed，之后长期降级为纯 RRF 排序，检索不崩。
         """
         if not ENABLE_RERANK or self._reranker is not None or self._reranker_failed:
             return self._reranker
@@ -298,18 +315,28 @@ class HybridRetriever:
             if self._reranker is not None or self._reranker_failed:
                 return self._reranker
             try:
-                if RERANK_OFFLINE:
-                    # 模型已缓存，离线模式跳过联网校验，加载更快也更稳定
-                    import os
-                    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-                    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-                from sentence_transformers import CrossEncoder
-                print(f"[retriever] 正在加载精排模型 {RERANK_MODEL} ...")
-                self._reranker = CrossEncoder(RERANK_MODEL, max_length=RERANK_MAX_LENGTH)
-                print(f"[retriever] 精排模型加载完成（apply_softmax={RERANK_APPLY_SOFTMAX}）")
+                if RERANK_BACKEND == "api":
+                    self._reranker = httpx.Client(
+                        timeout=httpx.Timeout(RERANK_API_TIMEOUT),
+                        headers={
+                            "Authorization": f"Bearer {require_api_key()}",
+                            "Content-Type": "application/json",
+                        },
+                    )
+                    print(f"[retriever] 精排后端=API（{RERANK_API_MODEL}），本地零模型占用")
+                else:
+                    if RERANK_OFFLINE:
+                        # 模型已缓存，离线模式跳过联网校验，加载更快也更稳定
+                        import os
+                        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+                    from sentence_transformers import CrossEncoder
+                    print(f"[retriever] 正在加载精排模型 {RERANK_MODEL} ...")
+                    self._reranker = CrossEncoder(RERANK_MODEL, max_length=RERANK_MAX_LENGTH)
+                    print(f"[retriever] 精排后端=本地模型（apply_softmax={RERANK_APPLY_SOFTMAX}）")
             except Exception as e:
                 self._reranker_failed = True
-                print(f"[retriever] ⚠️ 精排模型加载失败，降级为 RRF 排序：{type(e).__name__}: {e}")
+                print(f"[retriever] ⚠️ 精排后端初始化失败，降级为 RRF 排序：{type(e).__name__}: {e}")
         return self._reranker
 
     # ---------- 各路召回 ----------
@@ -396,16 +423,23 @@ class HybridRetriever:
         if reranker is None:
             return hits
 
-        pairs = [[query, h["text"]] for h in hits]
-        try:
-            # ★ apply_softmax 必须用 config 里的 False，理由见文件头注释
-            scores = reranker.predict(pairs, apply_softmax=RERANK_APPLY_SOFTMAX)
-        except Exception as e:
-            print(f"[retriever] ⚠️ 精排打分失败，降级为 RRF 排序：{type(e).__name__}: {e}")
-            return hits
+        if RERANK_BACKEND == "api":
+            scores = self._api_rerank_scores(reranker, query, [h["text"] for h in hits])
+        else:
+            pairs = [[query, h["text"]] for h in hits]
+            try:
+                # ★ apply_softmax 必须用 config 里的 False，理由见文件头注释
+                scores = list(reranker.predict(pairs, apply_softmax=RERANK_APPLY_SOFTMAX))
+            except Exception as e:
+                print(f"[retriever] ⚠️ 精排打分失败，降级为 RRF 排序：{type(e).__name__}: {e}")
+                return hits
 
+        # scores 与 hits 一一对应；个别候选拿不到分数时留 None（排序垫底），不影响其余
+        if scores is None:
+            return hits
         for h, s in zip(hits, scores):
-            h["rerank_score"] = float(s)
+            if s is not None:
+                h["rerank_score"] = float(s)
 
         before = [h["text"][:24] for h in hits]
         hits.sort(key=lambda x: x.get("rerank_score", float("-inf")), reverse=True)
@@ -413,6 +447,41 @@ class HybridRetriever:
         if VERBOSE_LOG and before != after:
             print("[retriever]   精排调整了顺序")
         return hits
+
+    def _api_rerank_scores(self, client, query: str, docs: list):
+        """
+        调用百炼 qwen3-rerank 接口，返回与 docs 等长的分数列表（按原始顺序归位）。
+        失败返回 None，由调用方降级。
+        官方接口：POST {RERANK_API_URL}，qwen3-rerank 用扁平请求体。
+        """
+        body = {
+            "model": RERANK_API_MODEL,
+            "query": query,
+            "documents": docs,
+        }
+        try:
+            resp = client.post(RERANK_API_URL, json=body)
+            resp.raise_for_status()
+            data = resp.json()
+            # 兼容两种响应结构：顶层 results（qwen3-rerank）或 output.results（旧格式）
+            results = data.get("results")
+            if results is None:
+                results = (data.get("output") or {}).get("results")
+            if not isinstance(results, list):
+                print(f"[retriever] ⚠️ 精排接口返回结构异常，降级为 RRF 排序：keys={list(data)}")
+                return None
+            scores = [None] * len(docs)
+            for r in results:
+                idx = r.get("index")
+                if isinstance(idx, int) and 0 <= idx < len(docs):
+                    scores[idx] = r.get("relevance_score")
+            if VERBOSE_LOG:
+                used = data.get("usage", {})
+                print(f"[retriever]   精排 API 完成，候选 {len(docs)} 条，tokens={used.get('total_tokens')}")
+            return scores
+        except Exception as e:
+            print(f"[retriever] ⚠️ 精排接口调用失败，降级为 RRF 排序：{type(e).__name__}: {e}")
+            return None
 
     # ---------- 主入口 ----------
     def search_sync(self, query: str, top_k: int = DEFAULT_TOP_K) -> list:
@@ -488,12 +557,13 @@ class HybridRetriever:
         # 不能拿精排阈值去卡，否则会把所有结果误杀光。
         reranked = any(c.get("rerank_score") is not None for c in candidates)
         if reranked:
+            threshold = rerank_score_threshold()
             kept = []
             for c in candidates:
                 score = c.get("rerank_score")
-                if score is not None and score < RERANK_SCORE_THRESHOLD:
+                if score is not None and score < threshold:
                     if VERBOSE_LOG:
-                        print(f"[retriever]   精排阈值剔除（{score:.4f} < {RERANK_SCORE_THRESHOLD}）：{c['text'][:30]}...")
+                        print(f"[retriever]   精排阈值剔除（{score:.4f} < {threshold}）：{c['text'][:30]}...")
                     continue
                 kept.append(c)
             candidates = kept
@@ -518,7 +588,18 @@ class HybridRetriever:
     async def search(self, query: str, top_k: int = DEFAULT_TOP_K) -> list:
         """
         异步入口。
-        ★ CrossEncoder.predict 是 CPU 密集的阻塞调用，直接 await 会卡死整个
-          事件循环（FastAPI 所有并发请求都会停住）。丢到线程池里跑。
+        ★ 精排是同步阻塞的（api 后端 = 同步 HTTP 请求；local 后端 = CPU 密集的
+          模型推理），直接 await 会卡死整个事件循环（FastAPI 所有并发请求都会
+          停住）。统一丢到线程池里跑。
         """
         return await asyncio.to_thread(self.search_sync, query, top_k)
+
+    def close(self):
+        """释放精排后端持有的资源（api 后端的连接池），服务退出时调用。"""
+        reranker = self._reranker
+        if reranker is not None and RERANK_BACKEND == "api":
+            try:
+                reranker.close()
+            except Exception:
+                pass
+        self._reranker = None

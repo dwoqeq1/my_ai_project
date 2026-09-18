@@ -1,10 +1,11 @@
-# main.py (RAG 完整版：密钥外置 + 混合检索 + 精排 + 来源回传 + 前端转义)
+# main.py (RAG 完整版：密钥外置 + 混合检索 + 精排 + 来源回传 + 热更新 + 前端转义)
+import asyncio
 import json
 
 import chromadb
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
@@ -18,11 +19,14 @@ from config import (
     ENABLE_RERANK,
     MODEL_NAME,
     RECALL_TOP_K,
-    RERANK_SCORE_THRESHOLD,
+    RERANK_API_MODEL,
+    RERANK_BACKEND,
     VERBOSE_LOG,
     require_api_key,
+    rerank_score_threshold,
 )
 from retriever import HybridRetriever
+from ingest import ingest_directory
 
 # ---------- 初始化 FastAPI ----------
 app = FastAPI(title="RAG Agent 接口")
@@ -47,13 +51,14 @@ collection = chroma_client.get_or_create_collection(
 )
 
 # ---------- 初始化混合检索器 ----------
-# 向量检索 + BM25 关键词检索 -> RRF 融合 -> CrossEncoder 精排 -> 阈值过滤
-# 精排模型懒加载：首次检索时才加载，导入本模块不会拖慢启动。
+# 向量检索 + BM25 关键词检索 -> RRF 融合 -> 精排（API 或本地）-> 阈值过滤
+# 精排后端懒加载：首次检索时才初始化，导入本模块不会拖慢启动。
 retriever = HybridRetriever(collection)
 _corpus_size = retriever.reload()
+_backend_desc = f"API({RERANK_API_MODEL})" if RERANK_BACKEND == "api" else "本地模型"
 print(f"[main] 检索器就绪：{_corpus_size} 块语料 | "
-      f"BM25={'开' if ENABLE_BM25 else '关'} | 精排={'开' if ENABLE_RERANK else '关'} | "
-      f"粗召回={RECALL_TOP_K} | 精排阈值={RERANK_SCORE_THRESHOLD}")
+      f"BM25={'开' if ENABLE_BM25 else '关'} | 精排={'开' if ENABLE_RERANK else '关'}（{_backend_desc}）| "
+      f"粗召回={RECALL_TOP_K} | 精排阈值={rerank_score_threshold()}")
 
 # ---------- 请求模型 ----------
 class ChatRequest(BaseModel):
@@ -195,6 +200,50 @@ async def chat_stream(req: ChatRequest):
     )
 
 
+# ---------- 热更新知识库（方向 2：目录化 + 进程内重建） ----------
+# 往 KNOWLEDGE_DIR 丢文件/删文件后，调一次这个接口即可生效，无需重启服务。
+# ★ 为什么必须放在服务进程内：Chroma PersistentClient 官方只支持单进程使用，
+#   服务跑着时另开进程跑 build_index.py 会撞 SQLite 锁或读到旧快照。
+#   入库放在本进程里做，锁问题从根上不存在。
+_reindex_lock = asyncio.Lock()
+
+
+@app.post("/api/reindex")
+async def reindex():
+    if _reindex_lock.locked():
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False, "reason": "已有重建任务在进行中，请稍后再试"},
+        )
+    async with _reindex_lock:
+        try:
+            # 入库会调 embedding 接口（同步、可能几十秒），丢线程池，不卡事件循环
+            result = await asyncio.to_thread(ingest_directory, collection)
+            corpus = await asyncio.to_thread(retriever.reload)  # BM25 跟新库重建
+        except Exception as e:
+            print(f"reindex 失败: {type(e).__name__}: {e}")
+            return JSONResponse(
+                status_code=500,
+                content={"ok": False, "reason": f"{type(e).__name__}: {e}"},
+            )
+    docs = [
+        {"source": d.source, "chunks": d.chunks, "action": d.action,
+         **({"error": d.error} if d.error else {})}
+        for d in result["documents"]
+    ]
+    changed = sum(1 for d in docs if d["action"] == "upserted")
+    skipped = sum(1 for d in docs if d["action"] == "skipped")
+    return {
+        "ok": True,
+        "total_chunks": result["total"],
+        "corpus_size": corpus,          # BM25 已同步重建到此规模
+        "changed": changed,
+        "unchanged": skipped,
+        "removed": result["removed_sources"],
+        "documents": docs,
+    }
+
+
 # ---------- 测试页面（增加 top_k 与来源展示） ----------
 @app.get("/")
 async def get_test_page():
@@ -222,7 +271,7 @@ async def get_test_page():
                     const topk = parseInt(document.getElementById('topk').value || '3', 10);
                     // ★ 用 textContent 清空，不用 innerHTML
                     resDiv.textContent = '';
-                    srcDiv.textContent = '检索中...（首次请求需加载本地精排模型，约 1.1GB，请稍候）';
+                    srcDiv.textContent = '检索中...（若使用本地精排模型，首次请求需加载约 1.1GB，请稍候）';
 
                     let response;
                     try {

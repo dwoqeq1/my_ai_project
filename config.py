@@ -22,12 +22,23 @@ DASHSCOPE_BASE_URL = os.environ.get(
 MODEL_NAME = os.environ.get("MODEL_NAME", "qwen-plus").strip()
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-v3").strip()
 
-# ---------- 向量库 ----------
+# ---------- 向量库与知识库 ----------
 CHROMA_PATH = os.environ.get("CHROMA_PATH", str(PROJECT_ROOT / "chroma_db")).strip()
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "knowledge").strip()
-KNOWLEDGE_FILE = os.environ.get(
-    "KNOWLEDGE_FILE", str(PROJECT_ROOT / "knowledge" / "example.txt")
-).strip()
+
+# ★ 知识库从「单文件」升级为「目录扫描」（方向 2）：
+#   往 KNOWLEDGE_DIR 里丢文件（含子目录），跑 build_index.py 或 POST /api/reindex 即入库。
+KNOWLEDGE_DIR = os.environ.get("KNOWLEDGE_DIR", str(PROJECT_ROOT / "knowledge")).strip()
+# 支持扫描的扩展名（逗号分隔）。pdf 解析需要 pypdf，已在 requirements.txt。
+KNOWLEDGE_EXTS = [
+    e.strip().lower()
+    for e in os.environ.get("KNOWLEDGE_EXTS", ".txt,.md,.pdf").split(",")
+    if e.strip()
+]
+
+# 分块参数：块越小检索越准但上下文越碎，200/30 适合中文条款/手册类文档
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "200"))
+CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "30"))
 
 # ---------- RAG 检索参数 ----------
 # 距离阈值：Chroma 默认 L2 距离，越小越相似。超过该值的块视为不相关，不注入 prompt。
@@ -52,28 +63,58 @@ RRF_VECTOR_WEIGHT = float(os.environ.get("RRF_VECTOR_WEIGHT", "1.0"))
 RRF_BM25_WEIGHT = float(os.environ.get("RRF_BM25_WEIGHT", "1.0"))
 
 # ---------- 精排（Rerank）----------
-# 是否启用 CrossEncoder 精排。关掉则只用 RRF 融合结果排序。
+# 是否启用精排。关掉则只用 RRF 融合结果排序。
 ENABLE_RERANK = os.environ.get("ENABLE_RERANK", "1").strip() not in ("0", "", "false", "False")
+
+# ★ 精排后端：api（默认）| local ★
+#   api   = 调用阿里云百炼 qwen3-rerank 接口。本地零模型占用（省掉约 1.1GB
+#           模型与推理内存），复用同一个 DASHSCOPE_API_KEY，按量计费。
+#   local = 加载本地 CrossEncoder（bge-reranker-base，约 1.1GB），
+#           适合大语料/高频检索/断网场景，也不产生额外费用。
+# 两种实现都保留在 retriever.py 里，改一行环境变量即可切换。
+RERANK_BACKEND = os.environ.get("RERANK_BACKEND", "api").strip().lower()
+if RERANK_BACKEND not in ("api", "local"):
+    RERANK_BACKEND = "api"
+
+# --- api 后端参数 ---
+# 官方文档：https://help.aliyun.com/zh/model-studio/text-rerank-api
+# 注意 gte-rerank（老模型）已于 2026-05-30 下线，这里用推荐的 qwen3-rerank。
+RERANK_API_MODEL = os.environ.get("RERANK_API_MODEL", "qwen3-rerank").strip()
+RERANK_API_URL = os.environ.get(
+    "RERANK_API_URL", "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
+).strip()
+RERANK_API_TIMEOUT = float(os.environ.get("RERANK_API_TIMEOUT", "8"))
+
+# --- local 后端参数（仅 RERANK_BACKEND=local 时生效）---
 RERANK_MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-base").strip()
 RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", "512"))
 
-# ★ 精排分数阈值：默认 0.005，由 16 条标注查询实测确定（不是拍脑袋）。
-#   在 knowledge/example.txt 上扫 bge-reranker-base 的分数分布：
-#     阈值 0.005 -> A/B 类命中 12/12，C 类正确拒答 4/4（满分）
-#     阈值 0.05  -> 只 9/12，误杀了「CTO 的名字叫什么」等 3 条有效查询
-#   安全边际：C 类（应拒答）最高分 +0.0028，B 类最低有效分 +0.0137，
-#            0.005 落在两者之间，两边各有约 1.8x / 2.7x 余量。
+# ★ 精排分数阈值（两套后端各用各的，量纲不同，不能混用）★
 #
+# 【local 后端】默认 0.005，由 16 条标注查询在 bge-reranker-base(logit) 上实测：
+#   阈值 0.005 -> A/B 类命中 12/12，C 类正确拒答 4/4；0.05 会误杀 3 条有效查询。
+#   C 类最高分 +0.0028，B 类最低有效分 +0.0137，0.005 落在中间。
 #   ★★ 重要教训：精排的「排序能力」远比「绝对分数」可靠。★★
-#   同一个意思的查询，绝对分数能差 72 倍（「CTO 李娜」+0.9940 vs
-#   「CTO 的名字叫什么」+0.0137），但排序全都把正确块排在第一。
-#   所以阈值必须偏低，宁可多放一点无关片段进 prompt（system prompt 里有
-#   「资料中没有就诚实说无法回答」兜底），也不要误杀有效结果——
-#   漏召会让模型直接答不上来，代价比误召大得多。
+#   同一个意思的查询，绝对分数能差 72 倍，但排序全都正确。
+#   所以阈值必须偏低：漏召让模型直接答不上来，误召只是多塞片段（prompt 有
+#   「资料没有就说无法回答」兜底）。换语料/换模型后必须重新实测。
 #
-#   换语料或换模型后必须重新实测（方法见 README「调参依据」），
-#   样本要覆盖「短实体查询」这类难例，否则测不出误杀。
-RERANK_SCORE_THRESHOLD = float(os.environ.get("RERANK_SCORE_THRESHOLD", "0.005"))
+# 【api 后端】qwen3-rerank 返回 0~1 的 relevance_score。官方文档明确写着：
+#   该分数是「本次请求内的相对分数，不可作为跨请求比较的绝对值」——
+#   和我们在 local 上实测出的教训完全一致。
+#   默认 0.4，由评测集 13 条标注查询在真实库上实测得出：
+#     有效查询（A/B 类 10 条）top1 分数 >= 0.6641；
+#     无关查询（C 类 3 条）  top1 分数 <= 0.2963。
+#   0.4 落在空白带偏下位置（漏召代价 > 误召），两头余量约 1.35x / 1.66x。
+#   ★ 上一版默认值 0.01 是拍脑袋定的，恰好低于 C 类分数带，消融评测中
+#     拒答正确率从 3/3 跌到 1/3——这就是「阈值必须实测」的第二次教训。
+RERANK_SCORE_THRESHOLD_LOCAL = float(os.environ.get("RERANK_SCORE_THRESHOLD_LOCAL", "0.005"))
+RERANK_SCORE_THRESHOLD_API = float(os.environ.get("RERANK_SCORE_THRESHOLD_API", "0.4"))
+
+
+def rerank_score_threshold() -> float:
+    """按当前后端返回对应阈值（两套量纲不可混用）。"""
+    return RERANK_SCORE_THRESHOLD_API if RERANK_BACKEND == "api" else RERANK_SCORE_THRESHOLD_LOCAL
 
 # ★★ 关键：必须为 0（即使用默认 logit 模式）。★★
 #   实测 bge-reranker-base 是单输出模型，apply_softmax=True 时

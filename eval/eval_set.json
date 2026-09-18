@@ -1,0 +1,76 @@
+{
+  "_说明": "检索质量评测集。每行一个用例：query=提问；expect_sources=期望命中的文档（相对 knowledge/ 的路径，命中任意一个即算召回成功）；empty_ok=true 表示知识库没有答案、期望检索结果为空（模型应拒答或走通用知识）。新增文档后请同步补充用例。",
+  "cases": [
+    {
+      "id": "A1",
+      "query": "你们公司是什么时候成立的？",
+      "expect_sources": ["example.txt"]
+    },
+    {
+      "id": "A2",
+      "query": "标准版多少钱一个月？包含几个席位？",
+      "expect_sources": ["example.txt"]
+    },
+    {
+      "id": "A3",
+      "query": "企业版的价格和权益是什么？",
+      "expect_sources": ["example.txt"]
+    },
+    {
+      "id": "A4",
+      "query": "CTO 是谁？",
+      "expect_sources": ["example.txt"]
+    },
+    {
+      "id": "A5",
+      "query": "CTO 的名字叫什么",
+      "expect_sources": ["example.txt"],
+      "_备注": "上轮实测：这条在阈值 0.05 下被误杀，是阈值改为 0.005 的直接证据，永久保留防回归"
+    },
+    {
+      "id": "A6",
+      "query": "你们的主产品是什么？",
+      "expect_sources": ["example.txt"]
+    },
+    {
+      "id": "A7",
+      "query": "售后电话是多少？",
+      "expect_sources": ["example.txt"]
+    },
+    {
+      "id": "A8",
+      "query": "底层用了什么技术架构？",
+      "expect_sources": ["example.txt"]
+    },
+    {
+      "id": "B1",
+      "query": "试用申请发送到哪个邮箱",
+      "expect_sources": ["example.txt"],
+      "_备注": "精确标识符（邮箱地址）——向量检索盲区，验证 BM25 那一路"
+    },
+    {
+      "id": "B2",
+      "query": "9.9 万",
+      "expect_sources": ["example.txt"],
+      "_备注": "纯数字片段查询，验证字面召回"
+    },
+    {
+      "id": "C1",
+      "query": "今天股市行情怎么样？",
+      "expect_sources": [],
+      "empty_ok": true
+    },
+    {
+      "id": "C2",
+      "query": "如何用 Python 读取 Excel 文件？",
+      "expect_sources": [],
+      "empty_ok": true
+    },
+    {
+      "id": "C3",
+      "query": "明天的天气如何？",
+      "expect_sources": [],
+      "empty_ok": true
+    }
+  ]
+}
